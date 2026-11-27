@@ -109,6 +109,15 @@ static uint16_t *s_native_target;
 static uint32_t s_native_bytes;
 #endif
 #endif
+/* Also guard explicit refreshes in update/install callbacks after a DMA
+ * fault detected during an earlier refresh in the same timer iteration. */
+static void home_refr_now(lv_display_t *disp)
+{
+#ifdef CONFIG_LX_USE_ORTHO
+    if (s_ortho_fault) return;
+#endif
+    lv_refr_now(disp);
+}
 static lv_obj_t *s_home, *s_settings;
 static lv_obj_t *s_clk_area;            /* home clock: opens the clock setup (every board) */
 static void on_clk_open(lv_event_t *ev);
@@ -2318,7 +2327,7 @@ static void upd_progress(int percent)
     char buf[48];
     snprintf(buf, sizeof(buf), "Installing... %d%%", percent);
     lv_label_set_text(s_upd_text, buf);
-    lv_refr_now(s_disp);
+    home_refr_now(s_disp);
 }
 
 static void upd_message(const char *title, const char *text)
@@ -2580,7 +2589,7 @@ static void upd_install(void)
     esp_err_t err = lx_update_install(upd_progress);
     if (err == ESP_OK) {
         lv_label_set_text(s_upd_text, "Done. Restarting...");
-        lv_refr_now(s_disp);
+        home_refr_now(s_disp);
         vTaskDelay(pdMS_TO_TICKS(800));
         esp_restart();
     }
@@ -2713,6 +2722,7 @@ static void native_render_event(lv_event_t *event)
         s_native_drawn = false;
         s_native_target = NULL;
         s_native_lease = lx_comp_native_begin(&s_native_target);
+        if (!s_native_lease) s_native_retry = true;
         lv_display_set_buffers(s_disp, s_native_target ? s_native_target : s_frame,
                                NULL, s_native_bytes, LV_DISPLAY_RENDER_MODE_FULL);
     } else if (code == LV_EVENT_REFR_READY && s_native_lease) {
@@ -2727,6 +2737,7 @@ static void native_render_event(lv_event_t *event)
         s_native_retry = err != ESP_OK && !fault;
         if (fault) {
             s_ortho_fault = true;
+            lv_timer_pause(lv_display_get_refr_timer(s_disp));
             ESP_LOGE(TAG, "Native Ortho DMA fault: display quarantined until reset");
         }
     }
@@ -3277,7 +3288,7 @@ static void home_task(void *arg)
             /* The home screen as it was, at once: listing the card again takes most of a second, and until
              * something is drawn the app's last picture stays up, looking as if leaving it had not worked. */
             lv_obj_invalidate(lv_screen_active());
-            lv_refr_now(NULL);
+            home_refr_now(NULL);
             s_focused = NULL;
             refresh_home();
             lv_obj_invalidate(lv_screen_active());

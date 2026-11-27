@@ -344,7 +344,7 @@ esp_err_t lx_comp_blit(lx_surface_t *s, const lx_blit_t *b)
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     esp_err_t err = ESP_ERR_INVALID_ARG;
-    if (s != s_surface) goto out;
+    if (s_display_fault || s != s_surface) goto out;
     if (!s_blend) {
         ppa_client_config_t cfg = { .oper_type = PPA_OPERATION_BLEND, .max_pending_trans_num = 1 };
         err = ppa_register_client(&cfg, &s_blend);
@@ -452,7 +452,7 @@ esp_err_t lx_comp_blit_yuv(lx_surface_t *s, const lx_yuv_t *f)
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     esp_err_t err = ESP_ERR_INVALID_ARG;
-    if (s != s_surface || ow < 1 || oh < 1 || f->x + ow > s->w || f->y0 + oh > s->h) goto out;
+    if (s_display_fault || s != s_surface || ow < 1 || oh < 1 || f->x + ow > s->w || f->y0 + oh > s->h) goto out;
     size_t need = ((size_t)f->w * f->h * 3 / 2 + 63) & ~(size_t)63;
     if (need > s_yuv_size) {
         heap_caps_free(s_yuv);
@@ -497,7 +497,7 @@ esp_err_t lx_comp_fill(lx_surface_t *s, int x, int y, int w, int h, uint16_t col
     if (y < 0) { h += y; y = 0; }
     xSemaphoreTake(s_lock, portMAX_DELAY);
     esp_err_t err = ESP_ERR_INVALID_ARG;
-    if (s != s_surface) goto out;
+    if (s_display_fault || s != s_surface) goto out;
     if (x + w > s->w) w = s->w - x;
     if (y + h > s->h) h = s->h - y;
     err = ESP_OK;
@@ -601,7 +601,7 @@ static esp_err_t present_pixels(lx_surface_t *s, const void *pixels)
     int64_t waited = esp_timer_get_time() - t_w;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     esp_err_t err = ESP_ERR_INVALID_ARG;
-    if (s != s_surface) goto fail;
+    if (s_display_fault || s != s_surface) goto fail;
     s->t_wait += waited;
     if (!s_idle || s->nbuf < 2) {
         err = present_job(s, pixels ? pixels : s->buf[s->cur]);
