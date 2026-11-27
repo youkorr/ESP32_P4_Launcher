@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: MIT
+# Experimental compatibility preflight. No release or hardware claims.
+name: Ortho preflight (compile only)
+on:
+  push:
+    branches: [ortho-integration]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    container: espressif/idf:v5.5.6
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        board: [m5stack_tab5, guition_p4_43, guition_p4_43_v3, guition_p4_7, guition_p4_7_v3, waveshare_p4_35, elecrow_p4_aio]
+        variant: [original, lvgl96, ortho-dependency]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure disposable build inputs
+        shell: bash
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          variant = os.environ['VARIANT']
+          manifest = Path('launcher/main/idf_component.yml')
+          content = manifest.read_text()
+          assert content.count('lvgl/lvgl: "9.2.2"') == 1, 'Upstream manifest changed; review first'
+          if variant != 'original':
+              content = content.replace('lvgl/lvgl: "9.2.2"', 'lvgl/lvgl: "9.6.0"')
+          if variant == 'ortho-dependency':
+              content = content.rstrip() + '\n  youkorr/lv_draw_ortho: "0.2.0"\n'
+              defaults = Path('launcher/sdkconfig.defaults')
+              with defaults.open('a') as f:
+                  f.write('\nCONFIG_LV_USE_FLOAT=y\nCONFIG_LV_USE_MATRIX=y\nCONFIG_LV_DRAW_TRANSFORM_USE_MATRIX=y\n')
+          manifest.write_text(content)
+          PY
+      - name: Compile launcher
+        shell: bash
+        env:
+          BOARD: ${{ matrix.board }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -eo pipefail
+          . "$IDF_PATH/export.sh" > /dev/null
+          cd launcher
+          idf.py -B build_preflight -DLX_BOARD="$BOARD" build
+          if [ "$VARIANT" = ortho-dependency ]; then
+            grep -x 'CONFIG_LV_USE_FLOAT=y' "sdkconfig.$BOARD"
+            grep -x 'CONFIG_LV_USE_MATRIX=y' "sdkconfig.$BOARD"
+            grep -x 'CONFIG_LV_DRAW_TRANSFORM_USE_MATRIX=y' "sdkconfig.$BOARD"
+            find build_preflight -name 'lib*lv_draw_ortho*.a' -print | tee /tmp/ortho-libraries.txt
+            test -s /tmp/ortho-libraries.txt
+          fi
+          idf.py -B build_preflight -DLX_BOARD="$BOARD" size
+  relocation:
+    runs-on: ubuntu-24.04
+    container: espressif/idf:v5.5.6
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Existing PAPP relocation regression
+        shell: bash
+        run: |
+          set -eo pipefail
+          . "$IDF_PATH/export.sh" > /dev/null
+          python -m pip install pyelftools
+          python tests/host/test_reloc.py
