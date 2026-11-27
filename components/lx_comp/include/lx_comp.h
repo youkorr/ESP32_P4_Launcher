@@ -40,6 +40,7 @@ esp_err_t lx_comp_init(void);
 typedef struct {
     uint64_t home_frames, app_frames, overlay_frames;
     uint64_t native_frames, native_bytes;
+    uint64_t damage_copy_bytes, damage_copy_us, damage_full_frames, damage_partial_frames;
     uint64_t flip_wait_us, ppa_us, copy_us, copy_bytes, skipped_copy_bytes;
     uint64_t flip_timeouts, present_errors;
 } lx_comp_perf_t;
@@ -103,6 +104,10 @@ esp_err_t lx_comp_launcher_present_native(const uint16_t *frame);
 /* Pair every successful begin with end, on the same task. A NULL target
  * means render into private scratch, discard the frame. */
 bool lx_comp_native_begin(uint16_t **target);
+#ifdef CONFIG_LX_ORTHO_DIRECT
+bool lx_comp_native_begin_direct(uint16_t **target, bool full);
+void lx_comp_native_damage(int x1,int y1,int x2,int y2);
+#endif
 esp_err_t lx_comp_native_end(bool submit, bool dma_fault);
 /* Snapshot latest submitted native image while holding compositor ownership.
  * Pair successful begin with end on the same task. */

@@ -110,3 +110,27 @@ exhaustively explores bounded selection, submit, cancel and completion
 sequences; it does not emulate DSI hardware or FreeRTOS scheduling. Existing
 blocking game PPA operations remain. No OTA release, and native is off by
 default. CI exports experimental Tab5 binaries for A/B only.
+
+## Stage 5 — native DIRECT (ortho-direct)
+
+CONFIG_LX_ORTHO_DIRECT is opt-in and retains FULL as an A/B reference.
+A 32x16 native-pixel tile ledger tracks stale regions separately for each of
+three buffers. Before a partial render, the compositor copies only stale tile
+runs from the latest submitted home image to the retired target while holding
+its mutex. Flush records actual LVGL areas rotated into physical coordinates;
+only a successful submission advances history. Foreign writes (app surfaces,
+menus, private or legacy presentation), failed/cancelled targets and DMA faults
+invalidate history. A full-screen bootstrap is forced before further partial
+presentation. If an app intervenes between invalidation and acquisition, the
+partial draw is discarded to private scratch and retried FULL. This avoids
+writing scanned/retiring buffers or assuming that arbitrary app pixels are home.
+
+The ledger rounds changed areas to tiles; it may copy pixels the upcoming draw
+will replace. The final driver cache writeback is still full-frame, and sync
+copies use CPU memcpy with cache writeback before PPA rendering. No claim of
+zero inter-buffer traffic. Logs report partial/full counts and actual sync
+bytes/time separately from avoided final copies. The scratch buffer remains
+allocated. Host tests compare reconstructed complete frames pixel-for-pixel
+against a reference under changes, cancellations, foreign writes, and retirement
+waits. They do not validate physical DMA cache coherence or real-time scheduling.
+The blocking game PPA paths remain unchanged. No release before board tests.

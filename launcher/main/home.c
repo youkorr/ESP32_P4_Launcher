@@ -107,6 +107,9 @@ static bool s_ortho, s_ortho_pending, s_ortho_fault;
 static bool s_native, s_native_lease, s_native_drawn, s_native_retry;
 static uint16_t *s_native_target;
 static uint32_t s_native_bytes;
+#ifdef CONFIG_LX_ORTHO_DIRECT
+static bool s_direct_force_full = true, s_direct_full;
+#endif
 #endif
 #endif
 /* Also guard explicit refreshes in update/install callbacks after a DMA
@@ -2718,20 +2721,49 @@ static void native_render_event(lv_event_t *event)
 {
     if (!s_native) return;
     lv_event_code_t code = lv_event_get_code(event);
+#ifdef CONFIG_LX_ORTHO_DIRECT
+    /* REFR_START precedes layout/join; FULL invalidation here is legal.
+     * Never modify the invalidation list during RENDER_START or flush. */
+    if (code == LV_EVENT_REFR_START) {
+        s_direct_full = s_direct_force_full;
+        lv_display_set_render_mode(s_disp, s_direct_full ?
+                                   LV_DISPLAY_RENDER_MODE_FULL : LV_DISPLAY_RENDER_MODE_DIRECT);
+        if (s_direct_full) lv_obj_invalidate(lv_screen_active());
+        return;
+    }
+#endif
     if (code == LV_EVENT_RENDER_START) {
         s_native_drawn = false;
         s_native_target = NULL;
+#ifdef CONFIG_LX_ORTHO_DIRECT
+        s_native_lease = lx_comp_native_begin_direct(&s_native_target,s_direct_full);
+        lv_display_render_mode_t mode = s_direct_full ? LV_DISPLAY_RENDER_MODE_FULL : LV_DISPLAY_RENDER_MODE_DIRECT;
+#else
         s_native_lease = lx_comp_native_begin(&s_native_target);
-        if (!s_native_lease) s_native_retry = true;
+        lv_display_render_mode_t mode = LV_DISPLAY_RENDER_MODE_FULL;
+#endif
+        if (!s_native_lease) {
+            s_native_retry = true;
+#ifdef CONFIG_LX_ORTHO_DIRECT
+            s_direct_force_full = true;
+#endif
+        }
         lv_display_set_buffers(s_disp, s_native_target ? s_native_target : s_frame,
-                               NULL, s_native_bytes, LV_DISPLAY_RENDER_MODE_FULL);
+                               NULL, s_native_bytes, mode);
     } else if (code == LV_EVENT_REFR_READY && s_native_lease) {
         bool fault = lv_draw_ortho_ppa_stuck() || lv_draw_ortho_get_stats()->turner_failed;
         bool submit = s_native_drawn && s_native_target && !fault &&
                       lx_app_state() == LX_APP_IDLE;
         lv_display_set_buffers(s_disp, s_frame, NULL, s_native_bytes,
+#ifdef CONFIG_LX_ORTHO_DIRECT
+                               LV_DISPLAY_RENDER_MODE_DIRECT);
+#else
                                LV_DISPLAY_RENDER_MODE_FULL);
+#endif
         esp_err_t err = lx_comp_native_end(submit, fault);
+#ifdef CONFIG_LX_ORTHO_DIRECT
+        s_direct_force_full = err != ESP_OK;
+#endif
         s_native_lease = false;
         s_native_target = NULL;
         s_native_retry = err != ESP_OK && !fault;
@@ -2748,6 +2780,16 @@ static void flush_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px)
 {
 #ifdef CONFIG_LX_ORTHO_NATIVE
     if (s_native) {
+#ifdef CONFIG_LX_ORTHO_DIRECT
+        if (s_native_lease && s_native_target && px == (uint8_t *)s_native_target) {
+            /* LVGL 9.6 flush area is logical; matrix rendering rotates it
+             * into native coordinates. Track actual final areas, including
+             * LVGL's merged/expanded blur invalidations. */
+            lv_area_t native = *area;
+            lv_display_rotate_area(d,&native);
+            lx_comp_native_damage(native.x1,native.y1,native.x2,native.y2);
+        }
+#endif
         if (lv_display_flush_is_last(d))
             s_native_drawn = s_native_lease && s_native_target &&
                              px == (uint8_t *)s_native_target;
@@ -3207,6 +3249,13 @@ static void perf_tick(void)
                  (st.flip_wait_us-prev.flip_wait_us)/1000.0/sec);
         ESP_LOGI("lx_perf", "native %.1f submissions/s; panel copy avoided %.1f KiB/s",
                  (st.native_frames-prev.native_frames)/sec, (st.native_bytes-prev.native_bytes)/1024.0/sec);
+#ifdef CONFIG_LX_ORTHO_DIRECT
+        ESP_LOGI("lx_perf", "DIRECT partial/full %llu/%llu; damage sync %.1f KiB/s %.1f ms/s",
+                 (unsigned long long)(st.damage_partial_frames-prev.damage_partial_frames),
+                 (unsigned long long)(st.damage_full_frames-prev.damage_full_frames),
+                 (st.damage_copy_bytes-prev.damage_copy_bytes)/1024.0/sec,
+                 (st.damage_copy_us-prev.damage_copy_us)/1000.0/sec);
+#endif
         ESP_LOGI("lx_perf", "copy %.1f KiB/s %.1f ms/s; skipped %.1f KiB/s; timeouts %llu errors %llu",
                  (st.copy_bytes-prev.copy_bytes)/1024.0/sec, (st.copy_us-prev.copy_us)/1000.0/sec,
                  (st.skipped_copy_bytes-prev.skipped_copy_bytes)/1024.0/sec,
@@ -3278,6 +3327,9 @@ static void home_task(void *arg)
             continue;
         }
         if (was_running) {                      /* back from an app: redraw everything */
+#ifdef CONFIG_LX_ORTHO_DIRECT
+            s_direct_force_full = true;
+#endif
             was_running = false;
             lx_net_pause(false);
             lx_input_flush();
@@ -3394,10 +3446,19 @@ esp_err_t home_start(void)
         }
         if (s_native) {
             s_native_bytes = bytes;
+#ifdef CONFIG_LX_ORTHO_DIRECT
+            lv_display_set_render_mode(s_disp, LV_DISPLAY_RENDER_MODE_DIRECT);
+            lv_display_add_event_cb(s_disp, native_render_event, LV_EVENT_REFR_START, NULL);
+#else
             lv_display_set_render_mode(s_disp, LV_DISPLAY_RENDER_MODE_FULL);
+#endif
             lv_display_add_event_cb(s_disp, native_render_event, LV_EVENT_RENDER_START, NULL);
             lv_display_add_event_cb(s_disp, native_render_event, LV_EVENT_REFR_READY, NULL);
+#ifdef CONFIG_LX_ORTHO_DIRECT
+            ESP_LOGI(TAG, "Ortho native DIRECT, per-buffer damage ledger");
+#else
             ESP_LOGI(TAG, "Ortho native FULL, three fenced panel buffers");
+#endif
         }
 #endif
     }

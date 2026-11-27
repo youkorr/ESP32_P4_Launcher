@@ -20,4 +20,12 @@ config LX_ORTHO_NATIVE
         Tab5 allocates three native DSI buffers. LVGL FULL renders directly
         into a leased hidden buffer; other boards keep their private path.
         Experimental; requires hardware acceptance before release.
+config LX_ORTHO_DIRECT
+    bool "Experimental native DIRECT damage synchronization"
+    depends on LX_ORTHO_NATIVE
+    default n
+    help
+        Retain the FULL mode as a reference. Synchronize only stale native
+        tiles before rendering changed LVGL regions. Rebootstrap with a
+        full redraw after app/overlay ownership changes or failed frames.
 endmenu

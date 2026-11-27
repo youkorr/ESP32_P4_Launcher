@@ -7,6 +7,9 @@
  * PPA rotates the pixels on the way.
  */
 #include "lx_comp.h"
+#ifdef CONFIG_LX_ORTHO_DIRECT
+#include "lx_damage.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,6 +54,17 @@ static int s_dw, s_dh;                    /* landscape display size */
 static lx_comp_perf_t s_perf; /* all accesses under s_lock */
 static int s_overlay_back = -1, s_native_back = -1;
 static bool s_display_fault; /* never reuse a native target after an uncertain DMA */
+#ifdef CONFIG_LX_ORTHO_DIRECT
+static lx_damage_t s_damage;
+static lx_damage_map_t s_changed;
+static bool s_direct_lease, s_direct_full, s_direct_bad, s_direct_whole;
+#endif
+static void invalidate_home_history_locked(void)
+{
+#ifdef CONFIG_LX_ORTHO_DIRECT
+    lx_damage_reset(&s_damage);
+#endif
+}
 
 
 bool lx_comp_perf_snapshot(lx_comp_perf_t *out)
@@ -216,6 +230,7 @@ lx_surface_t *lx_comp_surface_create(int w, int h, lx_scale_t scale, int buffers
     }
     layout(s);
     memset(s_fb_clean, 0, sizeof(s_fb_clean));
+    invalidate_home_history_locked();
     s_surface = s;
     ESP_LOGI(TAG, "surface %dx%d x%d -> %dx%d at %d,%d (scale %.4g x %.4g)", w, h, buffers,
              s->dst.w, s->dst.h, s->dst.x, s->dst.y, s->sx, s->sy);
@@ -537,6 +552,7 @@ static esp_err_t present_job(lx_surface_t *s, const void *src)
     int back = acquire_back_locked();
     s->t_wait += esp_timer_get_time() - t_w;
     if (back < 0) return ESP_ERR_TIMEOUT;
+    invalidate_home_history_locked();
     uint16_t *fb = bsp_display_fb(back);
     size_t fb_bytes = (size_t)b->display_w * b->display_h * 2;
     if (!s_fb_clean[back]) {
@@ -661,6 +677,7 @@ esp_err_t lx_comp_launcher_present(const uint16_t *frame)
         xSemaphoreGive(s_lock);
         return ESP_ERR_TIMEOUT;
     }
+    invalidate_home_history_locked();
     uint16_t *fb = bsp_display_fb(back);
     ppa_srm_oper_config_t op = {
         .in = {
@@ -712,6 +729,7 @@ esp_err_t lx_comp_launcher_present_native(const uint16_t *frame)
         err = ESP_ERR_TIMEOUT;
         goto done;
     }
+    invalidate_home_history_locked();
     uint16_t *fb = bsp_display_fb(back);
     const bsp_info_t *b = bsp_info();
     size_t bytes = (size_t)b->display_w * b->display_h * 2;
@@ -741,6 +759,9 @@ bool lx_comp_native_begin(uint16_t **target)
     *target = NULL;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_native_back = -1;
+#ifdef CONFIG_LX_ORTHO_DIRECT
+    s_direct_lease = false;
+#endif
     if (!s_surface && !s_display_fault && bsp_display_fb_count() == 3) {
         s_native_back = acquire_back_locked();
         if (s_native_back >= 0) {
@@ -751,11 +772,63 @@ bool lx_comp_native_begin(uint16_t **target)
     return true;
 }
 
+#ifdef CONFIG_LX_ORTHO_DIRECT
+/* Full bootstrap is required if an app/overlay invalidated home history.
+ * A partial render without a valid source is sent to scratch and discarded. */
+bool lx_comp_native_begin_direct(uint16_t **target, bool full)
+{
+    if (!lx_comp_native_begin(target)) return false;
+    s_direct_lease = true;
+    s_direct_full = full;
+    s_direct_bad = false;
+    s_direct_whole = false;
+    lx_damage_clear(&s_changed);
+    const bsp_info_t *b = bsp_info();
+    if (!*target || b->display_w != LX_DMG_W || b->display_h != LX_DMG_H ||
+        (!full && (!s_damage.valid || s_damage.latest != bsp_display_visible()))) {
+        *target = NULL;
+        s_native_back = -1;
+        return true;
+    }
+    if (!full) {
+        const uint16_t *source = bsp_display_fb(s_damage.latest);
+        if (!source || source == *target) {
+            *target = NULL;
+            s_native_back = -1;
+            return true;
+        }
+        int64_t start = esp_timer_get_time();
+        size_t bytes = lx_damage_sync(*target,source,&s_damage.stale[s_native_back]);
+        s_perf.damage_copy_bytes += bytes;
+        s_perf.damage_copy_us += esp_timer_get_time()-start;
+        if (bytes && esp_cache_msync(*target,(size_t)LX_DMG_W*LX_DMG_H*2,
+                                     ESP_CACHE_MSYNC_FLAG_DIR_C2M) != ESP_OK) {
+            invalidate_home_history_locked();
+            ++s_perf.present_errors;
+            *target = NULL;
+            s_native_back = -1;
+        }
+    }
+    return true;
+}
+
+void lx_comp_native_damage(int x1,int y1,int x2,int y2)
+{
+    if (!s_direct_lease || s_native_back < 0) return;
+    if (!lx_damage_mark(&s_changed,x1,y1,x2,y2)) s_direct_bad = true;
+    if (x1 == 0 && y1 == 0 && x2 == LX_DMG_W-1 && y2 == LX_DMG_H-1)
+        s_direct_whole = true;
+}
+#endif
+
 esp_err_t lx_comp_native_end(bool submit, bool dma_fault)
 {
     esp_err_t err = ESP_ERR_INVALID_STATE;
     int back = s_native_back;
     s_native_back = -1;
+#ifdef CONFIG_LX_ORTHO_DIRECT
+    if (s_direct_lease && (s_direct_bad || (s_direct_full && !s_direct_whole))) submit = false;
+#endif
     if (dma_fault) {
         /* A timed-out PPA may still write to its destination. Fail closed:
          * do not lease, submit or create app surfaces again until reboot. */
@@ -772,6 +845,18 @@ esp_err_t lx_comp_native_end(bool submit, bool dma_fault)
             s_perf.native_bytes += bytes;
         } else ++s_perf.present_errors;
     }
+#ifdef CONFIG_LX_ORTHO_DIRECT
+    if (err == ESP_OK && s_direct_lease) {
+        lx_damage_commit(&s_damage,back,&s_changed,s_direct_full);
+        if (s_direct_full) ++s_perf.damage_full_frames;
+        else ++s_perf.damage_partial_frames;
+    } else if (back >= 0 || dma_fault) {
+        /* A cancelled draw may have written arbitrary pixels. Rebootstrap
+         * instead of assuming that its target still matches the ledger. */
+        invalidate_home_history_locked();
+    }
+    s_direct_lease = false;
+#endif
     xSemaphoreGive(s_lock);
     return err;
 }
@@ -806,6 +891,7 @@ static uint16_t *launcher_begin(bool over_app)
         xSemaphoreGive(s_lock);
         return NULL;
     }
+    invalidate_home_history_locked();
     s_overlay_back = back;
     s_fb_clean[back] = false;           /* the app's next present redraws the letterbox */
     return bsp_display_fb(back);
