@@ -12,4 +12,12 @@ config LX_ORTHO_TWO_CORES
     help
         Attempt to enable the helper only if the internal heap reserve permits.
         Requires hardware measurement; one core remains the default.
+config LX_ORTHO_NATIVE
+    bool "Experimental native triple framebuffer Ortho (Tab5)"
+    depends on LX_USE_ORTHO
+    default n
+    help
+        Tab5 allocates three native DSI buffers. LVGL FULL renders directly
+        into a leased hidden buffer; other boards keep their private path.
+        Experimental; requires hardware acceptance before release.
 endmenu

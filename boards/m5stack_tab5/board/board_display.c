@@ -27,11 +27,15 @@
 
 static const char *TAG = "bsp_disp";
 
+#ifdef CONFIG_LX_ORTHO_NATIVE
+#define NUM_FBS 3
+#else
 #define NUM_FBS 2
+#endif
 
 static esp_lcd_panel_handle_t s_panel;
 static uint16_t *s_fbs[NUM_FBS];
-static lx_fb_fence_t s_fence;
+static lx_fb_fence_t s_fence = {.count = NUM_FBS};
 static portMUX_TYPE s_fence_lock = portMUX_INITIALIZER_UNLOCKED;
 static SemaphoreHandle_t s_vsync;
 
@@ -214,7 +218,13 @@ esp_err_t bsp_display_init(void)
     else ESP_RETURN_ON_ERROR(st712x_init(dsi, io, type == BOARD_PANEL_ST7121), TAG, "%s", board_panel_name());
 
     void *fb0 = NULL, *fb1 = NULL;
+#if NUM_FBS == 3
+    void *fb2 = NULL;
+    ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_get_frame_buffer(s_panel, NUM_FBS, &fb0, &fb1, &fb2), TAG, "fbs");
+    s_fbs[2] = fb2;
+#else
     ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_get_frame_buffer(s_panel, NUM_FBS, &fb0, &fb1), TAG, "fbs");
+#endif
     s_fbs[0] = fb0;
     s_fbs[1] = fb1;
 
@@ -263,21 +273,26 @@ esp_err_t bsp_display_show(int index)
     return err;
 }
 
-bool bsp_display_wait_flip(uint32_t timeout_ms)
+int bsp_display_acquire_back(uint32_t timeout_ms)
 {
-    if (!s_vsync) return false;
+    if (!s_vsync) return -1;
     TickType_t start = xTaskGetTickCount();
     TickType_t limit = pdMS_TO_TICKS(timeout_ms);
     for (;;) {
         portENTER_CRITICAL(&s_fence_lock);
-        bool ready = lx_fb_writable(&s_fence, s_fence.visible ^ 1);
+        int back = lx_fb_find_back(&s_fence);
         portEXIT_CRITICAL(&s_fence_lock);
-        if (ready) return true;
-        if ((TickType_t)(xTaskGetTickCount() - start) >= limit) return false;
+        if (back >= 0) return back;
+        if ((TickType_t)(xTaskGetTickCount() - start) >= limit) return -1;
         /* The semaphore is only a wake hint; a concurrent vsync waiter
          * cannot consume proof of retirement. Poll the epoch every tick. */
         xSemaphoreTake(s_vsync, 1);
     }
+}
+
+bool bsp_display_wait_flip(uint32_t timeout_ms)
+{
+    return bsp_display_acquire_back(timeout_ms) >= 0;
 }
 
 int bsp_display_visible(void)

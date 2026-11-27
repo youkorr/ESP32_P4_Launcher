@@ -87,3 +87,26 @@ existing blocking game PPA operations remain; a stuck PPA requires reset.
 Do not share LVGL buffers with games until a full render lease and app
 handoff (including DevLink starts, overlays, screenshots and errors) have
 been tested. No OTA release or performance claims before hardware A/B.
+
+## Stage 4 — opt-in native FULL prototype (ortho-native)
+
+CONFIG_LX_ORTHO_NATIVE enables three physical framebuffers on Tab5 only.
+The compositor selects an individually retired hidden buffer; all app and
+legacy presentation paths use the same selector, including overlay begin/end.
+LVGL FULL mode retargets its single draw descriptor at RENDER_START to the
+leased native buffer, restores private scratch at REFR_READY, and submits
+only a completed frame while no app owns the display. The mutex covers the
+render, not the timer handler. A failed acquisition draws only into scratch
+and retries; a DMA fault quarantines native display ownership until reboot.
+Snapshots serialize with the compositor, and BMP writing uses a private copy.
+Native counters count successful no-final-copy submissions, not scanout FPS.
+
+FULL redraw is deliberate for the first experiment: no stale partial regions
+on alternating buffers. It can be slower than private DIRECT on small UI
+updates. Scratch remains allocated, so the extra 720x1280 RGB565 buffer costs
+1,843,200 bytes of PSRAM; a later damage-tracked DIRECT implementation may
+reduce this cost. Do not infer speedup from compilation. The host test
+exhaustively explores bounded selection, submit, cancel and completion
+sequences; it does not emulate DSI hardware or FreeRTOS scheduling. Existing
+blocking game PPA operations remain. No OTA release, and native is off by
+default. CI exports experimental Tab5 binaries for A/B only.

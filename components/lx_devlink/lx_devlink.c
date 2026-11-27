@@ -13,6 +13,7 @@
 #include "lx_app.h"
 #include "lx_common.h"
 #include "bsp.h"
+#include "lx_comp.h"
 #include "lx_input.h"
 #include "lx_net.h"
 #include "lx_bt.h"
@@ -533,7 +534,15 @@ static void h_shot(uint16_t seq, const uint8_t *p, uint32_t len)
     if (off == 0) {
         if (!s_shot) s_shot = heap_caps_malloc(pixels * 2 + (pixels / 0x7FFF + 1) * 2 + 64, MALLOC_CAP_SPIRAM);
         if (!s_shot) { reply_err(DL_SHOT, seq, "no memory for snapshot"); return; }
-        s_shot_len = rle16(bsp_display_fb(bsp_display_visible()), pixels, s_shot);
+        const uint16_t *frame = lx_comp_snapshot_begin();
+        if (!frame) {
+            heap_caps_free(s_shot);
+            s_shot = NULL;
+            reply_err(DL_SHOT, seq, "display unavailable");
+            return;
+        }
+        s_shot_len = rle16(frame, pixels, s_shot);
+        lx_comp_snapshot_end();
     }
     if (!s_shot) { reply_err(DL_SHOT, seq, "no snapshot; request offset 0 first"); return; }
 

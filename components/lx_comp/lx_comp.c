@@ -46,9 +46,12 @@ static size_t s_tmp_size;
 static uint8_t *s_yuv;                     /* lx_comp_blit_yuv: the frame in the PPA's YUV420 layout */
 static size_t s_yuv_size;
 static lx_surface_t *s_surface;           /* v1: one surface at a time */
-static bool s_fb_clean[2];                /* fb holds only black outside the surface rect */
+static bool s_fb_clean[3];                /* fb holds only black outside the surface rect */
 static int s_dw, s_dh;                    /* landscape display size */
 static lx_comp_perf_t s_perf; /* all accesses under s_lock */
+static int s_overlay_back = -1, s_native_back = -1;
+static bool s_display_fault; /* never reuse a native target after an uncertain DMA */
+
 
 bool lx_comp_perf_snapshot(lx_comp_perf_t *out)
 {
@@ -58,13 +61,27 @@ bool lx_comp_perf_snapshot(lx_comp_perf_t *out)
     return true;
 }
 
-static bool wait_flip_measured(void)
+/* Existing board implementations remain two-buffer. A board with three
+ * buffers must supply its own individually fenced selection. */
+__attribute__((weak)) int bsp_display_acquire_back(uint32_t timeout_ms)
 {
+    if (bsp_display_fb_count() != 2 || !bsp_display_wait_flip(timeout_ms)) return -1;
+    int visible = bsp_display_visible();
+    return visible == 0 || visible == 1 ? visible ^ 1 : -1;
+}
+
+static int acquire_back_locked(void)
+{
+    if (s_display_fault) return -1;
     int64_t start = esp_timer_get_time();
-    bool ok = bsp_display_wait_flip(FLIP_WAIT_MS);
+    int back = bsp_display_acquire_back(FLIP_WAIT_MS);
     s_perf.flip_wait_us += esp_timer_get_time() - start;
-    if (!ok) ++s_perf.flip_timeouts;
-    return ok;
+    if (back < 0 || back >= bsp_display_fb_count() || back >= 3 ||
+        back == bsp_display_visible() || !bsp_display_fb(back)) {
+        ++s_perf.flip_timeouts;
+        return -1;
+    }
+    return back;
 }
 
 /* Async present: the worker waits for the flip, scales with the PPA and flips while the app
@@ -98,7 +115,7 @@ static void present_worker(void *arg)
 esp_err_t lx_comp_init(void)
 {
     if (s_lock) return ESP_OK;
-    if (bsp_display_fb_count() < 2) return ESP_ERR_INVALID_STATE;
+    if (bsp_display_fb_count() < 2 || bsp_display_fb_count() > 3) return ESP_ERR_INVALID_STATE;
     const bsp_info_t *b = bsp_info();
     bool portrait = b->display_rot == 90 || b->display_rot == 270;
     s_dw = portrait ? b->display_h : b->display_w;
@@ -179,6 +196,7 @@ lx_surface_t *lx_comp_surface_create(int w, int h, lx_scale_t scale, int buffers
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     lx_surface_t *s = NULL;
+    if (s_display_fault) goto out;
     if (s_surface) {
         ESP_LOGW(TAG, "only one surface supported for now");
         goto out;
@@ -197,7 +215,7 @@ lx_surface_t *lx_comp_surface_create(int w, int h, lx_scale_t scale, int buffers
         }
     }
     layout(s);
-    s_fb_clean[0] = s_fb_clean[1] = false;
+    memset(s_fb_clean, 0, sizeof(s_fb_clean));
     s_surface = s;
     ESP_LOGI(TAG, "surface %dx%d x%d -> %dx%d at %d,%d (scale %.4g x %.4g)", w, h, buffers,
              s->dst.w, s->dst.h, s->dst.x, s->dst.y, s->sx, s->sy);
@@ -516,10 +534,9 @@ static esp_err_t present_job(lx_surface_t *s, const void *src)
 {
     const bsp_info_t *b = bsp_info();
     int64_t t_w = esp_timer_get_time();
-    bool retired = wait_flip_measured();
+    int back = acquire_back_locked();
     s->t_wait += esp_timer_get_time() - t_w;
-    if (!retired) return ESP_ERR_TIMEOUT;
-    int back = bsp_display_visible() ^ 1;
+    if (back < 0) return ESP_ERR_TIMEOUT;
     uint16_t *fb = bsp_display_fb(back);
     size_t fb_bytes = (size_t)b->display_w * b->display_h * 2;
     if (!s_fb_clean[back]) {
@@ -639,11 +656,11 @@ esp_err_t lx_comp_launcher_present(const uint16_t *frame)
     const bsp_info_t *b = bsp_info();
     size_t bytes = (size_t)s_dw * s_dh * 2;
     esp_cache_msync((void *)frame, bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-    if (!wait_flip_measured()) {
+    int back = acquire_back_locked();
+    if (back < 0) {
         xSemaphoreGive(s_lock);
         return ESP_ERR_TIMEOUT;
     }
-    int back = bsp_display_visible() ^ 1;
     uint16_t *fb = bsp_display_fb(back);
     ppa_srm_oper_config_t op = {
         .in = {
@@ -687,16 +704,15 @@ esp_err_t lx_comp_launcher_present_native(const uint16_t *frame)
     wait_idle();
     xSemaphoreTake(s_lock, portMAX_DELAY);
     esp_err_t err = ESP_ERR_INVALID_STATE;
-    if (s_surface || bsp_display_fb_count() != 2) goto done;
-    if (!wait_flip_measured()) {
+    if (s_surface || s_display_fault) goto done;
+    for (int i = 0; i < bsp_display_fb_count(); ++i)
+        if (bsp_display_fb(i) == frame) goto done;
+    int back = acquire_back_locked();
+    if (back < 0) {
         err = ESP_ERR_TIMEOUT;
-        goto done; /* never write after a failed retirement wait */
+        goto done;
     }
-    int visible = bsp_display_visible();
-    if (visible < 0 || visible > 1) goto done;
-    int back = visible ^ 1;
     uint16_t *fb = bsp_display_fb(back);
-    if (!fb || fb == frame || bsp_display_fb(visible) == frame) goto done;
     const bsp_info_t *b = bsp_info();
     size_t bytes = (size_t)b->display_w * b->display_h * 2;
     /* PPA writes to the private buffer have finished before flush. Its
@@ -711,6 +727,51 @@ esp_err_t lx_comp_launcher_present_native(const uint16_t *frame)
     if (err == ESP_OK) ++s_perf.home_frames;
     else ++s_perf.present_errors;
 done:
+    xSemaphoreGive(s_lock);
+    return err;
+}
+
+/* A render lease holds the compositor mutex only across LVGL rendering,
+ * not across input/timer callbacks. All app surface creation, presentation,
+ * overlays and snapshots serialize with it. A NULL target is a private
+ * scratch render with the mutex still held (no native submission). */
+bool lx_comp_native_begin(uint16_t **target)
+{
+    if (!target || !s_lock) return false;
+    *target = NULL;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_native_back = -1;
+    if (!s_surface && !s_display_fault && bsp_display_fb_count() == 3) {
+        s_native_back = acquire_back_locked();
+        if (s_native_back >= 0) {
+            s_fb_clean[s_native_back] = false;
+            *target = bsp_display_fb(s_native_back);
+        }
+    }
+    return true;
+}
+
+esp_err_t lx_comp_native_end(bool submit, bool dma_fault)
+{
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    int back = s_native_back;
+    s_native_back = -1;
+    if (dma_fault) {
+        /* A timed-out PPA may still write to its destination. Fail closed:
+         * do not lease, submit or create app surfaces again until reboot. */
+        s_display_fault = true;
+        ++s_perf.present_errors;
+    } else if (submit && !s_display_fault && !s_surface && back >= 0) {
+        const bsp_info_t *b = bsp_info();
+        size_t bytes = (size_t)b->display_w * b->display_h * 2;
+        err = esp_cache_msync(bsp_display_fb(back), bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+        if (err == ESP_OK) err = bsp_display_show(back);
+        if (err == ESP_OK) {
+            ++s_perf.home_frames;
+            ++s_perf.native_frames;
+            s_perf.native_bytes += bytes;
+        } else ++s_perf.present_errors;
+    }
     xSemaphoreGive(s_lock);
     return err;
 }
@@ -740,11 +801,12 @@ static uint16_t *launcher_begin(bool over_app)
         xSemaphoreGive(s_lock);
         return NULL;
     }
-    if (!wait_flip_measured()) {
+    int back = acquire_back_locked();
+    if (back < 0) {
         xSemaphoreGive(s_lock);
         return NULL;
     }
-    int back = bsp_display_visible() ^ 1;
+    s_overlay_back = back;
     s_fb_clean[back] = false;           /* the app's next present redraws the letterbox */
     return bsp_display_fb(back);
 }
@@ -759,12 +821,30 @@ uint16_t *lx_comp_takeover_begin(void)
     return launcher_begin(true);
 }
 
+const uint16_t *lx_comp_snapshot_begin(void)
+{
+    if (!s_lock) return NULL;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const uint16_t *src = bsp_display_fb(bsp_display_visible());
+    if (!src) xSemaphoreGive(s_lock);
+    return src;
+}
+
+void lx_comp_snapshot_end(void)
+{
+    xSemaphoreGive(s_lock);
+}
+
 void lx_comp_copy_visible(uint16_t *dst)
 {
+    if (!dst || !s_lock) return;
     const bsp_info_t *b = bsp_info();
     size_t bytes = (size_t)b->display_w * b->display_h * 2;
-    uint16_t *src = bsp_display_fb(bsp_display_visible());
-    if (src != dst) memcpy(dst, src, bytes);
+    /* Overlay drawing already owns this nonrecursive mutex. */
+    bool owned = xSemaphoreGetMutexHolder(s_lock) == xTaskGetCurrentTaskHandle();
+    const uint16_t *src = owned ? bsp_display_fb(bsp_display_visible()) : lx_comp_snapshot_begin();
+    if (src && src != dst) memcpy(dst, src, bytes);
+    if (src && !owned) lx_comp_snapshot_end();
 }
 
 esp_err_t lx_comp_screenshot(char *path, size_t len)
@@ -781,9 +861,24 @@ esp_err_t lx_comp_screenshot(char *path, size_t len)
         if (stat(name, &st) != 0) break;
     }
     uint16_t *row = heap_caps_calloc(1, stride, MALLOC_CAP_SPIRAM);
-    FILE *f = row ? fopen(name, "wb") : NULL;
+    uint16_t *snapshot = heap_caps_malloc((size_t)pw * ph * 2, MALLOC_CAP_SPIRAM);
+    if (!row || !snapshot) {
+        free(row);
+        free(snapshot);
+        return ESP_ERR_NO_MEM;
+    }
+    const uint16_t *source = lx_comp_snapshot_begin();
+    if (!source) {
+        free(row);
+        free(snapshot);
+        return ESP_ERR_INVALID_STATE;
+    }
+    memcpy(snapshot, source, (size_t)pw * ph * 2);
+    lx_comp_snapshot_end();
+    FILE *f = fopen(name, "wb");
     if (!f) {
         free(row);
+        free(snapshot);
         return ESP_FAIL;
     }
     uint32_t hdr[16] = { 0 };           /* from byte 2: the 2-byte magic comes first */
@@ -801,7 +896,7 @@ esp_err_t lx_comp_screenshot(char *path, size_t len)
     hdr[15] = 0x001F;
     fwrite("BM", 1, 2, f);
     fwrite(hdr, 4, 16, f);
-    const uint16_t *px = bsp_display_fb(bsp_display_visible());
+    const uint16_t *px = snapshot;
     for (int y = h - 1; y >= 0; y--) {
         for (int x = 0; x < w; x++) {
             row[x] = rot == 270 ? px[x * pw + (h - 1 - y)] : rot == 90 ? px[(w - 1 - x) * pw + y] : px[y * pw + x];
@@ -810,6 +905,7 @@ esp_err_t lx_comp_screenshot(char *path, size_t len)
     }
     fclose(f);
     free(row);
+    free(snapshot);
     ESP_LOGI(TAG, "saved %s", name);
     if (path) snprintf(path, len, "%s", name);
     return ESP_OK;
@@ -818,10 +914,11 @@ esp_err_t lx_comp_screenshot(char *path, size_t len)
 void lx_comp_launcher_end(void)
 {
     const bsp_info_t *b = bsp_info();
-    int back = bsp_display_visible() ^ 1;
-    esp_cache_msync(bsp_display_fb(back), (size_t)b->display_w * b->display_h * 2,
-                    ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-    if (bsp_display_show(back) == ESP_OK) ++s_perf.overlay_frames;
+    int back = s_overlay_back;
+    s_overlay_back = -1;
+    if (back >= 0 && esp_cache_msync(bsp_display_fb(back),
+            (size_t)b->display_w * b->display_h * 2, ESP_CACHE_MSYNC_FLAG_DIR_C2M) == ESP_OK &&
+            bsp_display_show(back) == ESP_OK) ++s_perf.overlay_frames;
     else ++s_perf.present_errors;
     xSemaphoreGive(s_lock);
 }

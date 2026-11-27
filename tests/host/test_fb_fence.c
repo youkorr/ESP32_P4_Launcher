@@ -12,7 +12,7 @@ int main(void)
     for (unsigned offset = 0; offset < 128; ++offset)
     for (unsigned before = 0; before < 6; ++before)
     for (unsigned after = 0; after < 6; ++after) {
-        lx_fb_fence_t f = {.epoch = UINT32_MAX - offset};
+        lx_fb_fence_t f = {.epoch = UINT32_MAX - offset, .count = 2};
         for (unsigned i = 0; i < before; ++i) lx_fb_completed(&f);
         for (unsigned round = 0; round < 64; ++round) {
             int old = f.visible, next = old ^ 1;

@@ -103,6 +103,11 @@ static lv_display_t *s_disp;
 static uint16_t *s_frame;
 #ifdef CONFIG_LX_USE_ORTHO
 static bool s_ortho, s_ortho_pending, s_ortho_fault;
+#ifdef CONFIG_LX_ORTHO_NATIVE
+static bool s_native, s_native_lease, s_native_drawn, s_native_retry;
+static uint16_t *s_native_target;
+static uint32_t s_native_bytes;
+#endif
 #endif
 static lv_obj_t *s_home, *s_settings;
 static lv_obj_t *s_clk_area;            /* home clock: opens the clock setup (every board) */
@@ -2670,7 +2675,7 @@ static bool ortho_prepare(int w, int h)
     if (strcmp(b->id, "m5stack_tab5") != 0 ||
         (b->display_rot != 90 && b->display_rot != 270) ||
         w != b->display_h || h != b->display_w ||
-        bsp_display_fb_count() != 2 ||
+        (bsp_display_fb_count() != 2 && bsp_display_fb_count() != 3) ||
         lv_draw_buf_width_to_stride(b->display_w, LV_COLOR_FORMAT_RGB565) !=
             (uint32_t)b->display_w * 2)
         return false;
@@ -2695,8 +2700,50 @@ static bool ortho_prepare(int w, int h)
 }
 #endif
 
+#ifdef CONFIG_LX_ORTHO_NATIVE
+/* FULL mode has no inter-buffer synchronization or partial stale pixels.
+ * LVGL 9.6 sends RENDER_START before drawing, REFR_READY after flush.
+ * The single draw buffer descriptor is retargeted only at those boundaries.
+ * Always restore private scratch before releasing the lease. */
+static void native_render_event(lv_event_t *event)
+{
+    if (!s_native) return;
+    lv_event_code_t code = lv_event_get_code(event);
+    if (code == LV_EVENT_RENDER_START) {
+        s_native_drawn = false;
+        s_native_target = NULL;
+        s_native_lease = lx_comp_native_begin(&s_native_target);
+        lv_display_set_buffers(s_disp, s_native_target ? s_native_target : s_frame,
+                               NULL, s_native_bytes, LV_DISPLAY_RENDER_MODE_FULL);
+    } else if (code == LV_EVENT_REFR_READY && s_native_lease) {
+        bool fault = lv_draw_ortho_ppa_stuck() || lv_draw_ortho_get_stats()->turner_failed;
+        bool submit = s_native_drawn && s_native_target && !fault &&
+                      lx_app_state() == LX_APP_IDLE;
+        lv_display_set_buffers(s_disp, s_frame, NULL, s_native_bytes,
+                               LV_DISPLAY_RENDER_MODE_FULL);
+        esp_err_t err = lx_comp_native_end(submit, fault);
+        s_native_lease = false;
+        s_native_target = NULL;
+        s_native_retry = err != ESP_OK && !fault;
+        if (fault) {
+            s_ortho_fault = true;
+            ESP_LOGE(TAG, "Native Ortho DMA fault: display quarantined until reset");
+        }
+    }
+}
+#endif
+
 static void flush_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px)
 {
+#ifdef CONFIG_LX_ORTHO_NATIVE
+    if (s_native) {
+        if (lv_display_flush_is_last(d))
+            s_native_drawn = s_native_lease && s_native_target &&
+                             px == (uint8_t *)s_native_target;
+        lv_display_flush_ready(d);
+        return; /* submit only at REFR_READY with the lease held */
+    }
+#endif
     if (lv_display_flush_is_last(d) && lx_app_state() == LX_APP_IDLE) {
 #ifdef CONFIG_LX_USE_ORTHO
         if (s_ortho) {
@@ -3147,6 +3194,8 @@ static void perf_tick(void)
                  (st.home_frames-prev.home_frames)/sec, (st.app_frames-prev.app_frames)/sec,
                  (st.overlay_frames-prev.overlay_frames)/sec, (st.ppa_us-prev.ppa_us)/1000.0/sec,
                  (st.flip_wait_us-prev.flip_wait_us)/1000.0/sec);
+        ESP_LOGI("lx_perf", "native %.1f submissions/s; panel copy avoided %.1f KiB/s",
+                 (st.native_frames-prev.native_frames)/sec, (st.native_bytes-prev.native_bytes)/1024.0/sec);
         ESP_LOGI("lx_perf", "copy %.1f KiB/s %.1f ms/s; skipped %.1f KiB/s; timeouts %llu errors %llu",
                  (st.copy_bytes-prev.copy_bytes)/1024.0/sec, (st.copy_us-prev.copy_us)/1000.0/sec,
                  (st.skipped_copy_bytes-prev.skipped_copy_bytes)/1024.0/sec,
@@ -3185,6 +3234,12 @@ static void home_task(void *arg)
     bool was_running = false, confirmed = false, offered = false;
     for (;;) {
         perf_tick();
+#ifdef CONFIG_LX_ORTHO_NATIVE
+        if (s_native_retry && !s_ortho_fault && lx_app_state() == LX_APP_IDLE) {
+            s_native_retry = false;
+            lv_obj_invalidate(lv_screen_active());
+        }
+#endif
 #ifdef CONFIG_LX_USE_ORTHO
         /* No explicit lv_refr_now paths after a detected DMA fault either.
          * Do not confirm an experimental boot or reuse the private buffer. */
@@ -3317,6 +3372,23 @@ esp_err_t home_start(void)
         lv_display_set_rotation(s_disp, bsp_info()->display_rot == 90 ?
             LV_DISPLAY_ROTATION_90 : LV_DISPLAY_ROTATION_270);
         lv_display_set_matrix_rotation(s_disp, true);
+#ifdef CONFIG_LX_ORTHO_NATIVE
+        s_native = bsp_display_fb_count() == 3;
+        if (s_native) {
+            for (int i = 0; i < 3; ++i) {
+                uint16_t *fb = bsp_display_fb(i);
+                if (!fb || lv_draw_buf_align(fb, LV_COLOR_FORMAT_RGB565) != (void *)fb)
+                    s_native = false;
+            }
+        }
+        if (s_native) {
+            s_native_bytes = bytes;
+            lv_display_set_render_mode(s_disp, LV_DISPLAY_RENDER_MODE_FULL);
+            lv_display_add_event_cb(s_disp, native_render_event, LV_EVENT_RENDER_START, NULL);
+            lv_display_add_event_cb(s_disp, native_render_event, LV_EVENT_REFR_READY, NULL);
+            ESP_LOGI(TAG, "Ortho native FULL, three fenced panel buffers");
+        }
+#endif
     }
 #endif
     lv_display_set_flush_cb(s_disp, flush_cb);

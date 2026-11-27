@@ -39,6 +39,7 @@ esp_err_t lx_comp_init(void);
  * verified optical FPS. Snapshot is nonblocking; retry if busy. */
 typedef struct {
     uint64_t home_frames, app_frames, overlay_frames;
+    uint64_t native_frames, native_bytes;
     uint64_t flip_wait_us, ppa_us, copy_us, copy_bytes, skipped_copy_bytes;
     uint64_t flip_timeouts, present_errors;
 } lx_comp_perf_t;
@@ -99,6 +100,14 @@ uint16_t *lx_comp_takeover_begin(void);
 esp_err_t lx_comp_launcher_present(const uint16_t *frame);
 /* Private native RGB565 frame, tightly packed; copies under compositor ownership. */
 esp_err_t lx_comp_launcher_present_native(const uint16_t *frame);
+/* Pair every successful begin with end, on the same task. A NULL target
+ * means render into private scratch, discard the frame. */
+bool lx_comp_native_begin(uint16_t **target);
+esp_err_t lx_comp_native_end(bool submit, bool dma_fault);
+/* Snapshot latest submitted native image while holding compositor ownership.
+ * Pair successful begin with end on the same task. */
+const uint16_t *lx_comp_snapshot_begin(void);
+void lx_comp_snapshot_end(void);
 /* Copies what is on screen into dst (a buffer from *_begin), to draw on top of it. */
 void      lx_comp_copy_visible(uint16_t *dst);
 /* The visible picture, landscape, as /sd/screenshots/shot_NNN.bmp; path (may be NULL) gets its name. */

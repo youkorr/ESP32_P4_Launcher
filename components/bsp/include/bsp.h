@@ -65,6 +65,10 @@ bool      bsp_display_wait_vsync(uint32_t timeout_ms);
  * longer scanned out (returns at once if it already is). Call before drawing
  * into the hidden buffer. */
 bool      bsp_display_wait_flip(uint32_t timeout_ms);
+/* Select a writable hidden buffer while the compositor owns its mutex.
+ * Default implementation supports existing two-buffer boards; Tab5
+ * overrides it to select any individually retired buffer. */
+int       bsp_display_acquire_back(uint32_t timeout_ms);
 void      bsp_display_backlight(int percent);   /* 0 = off                    */
 /* Test aid (DevLink "display off"): false stops the panel's scan-out of the frame buffers, so no
  * PSRAM bandwidth goes to the refresh, and turns the backlight off; true restores both. While it is
