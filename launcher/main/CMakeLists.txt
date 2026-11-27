@@ -8,5 +8,16 @@ idf_component_register(
 
 # Limit the external component's own allocation, not just the consumer's
 # macro. No changes to the downloaded sources or registry package.
-idf_component_get_property(ortho_lib youkorr__lv_draw_ortho COMPONENT_LIB)
+# Registry dependencies use the namespaced IDF name. An override_path
+# component is registered under its directory basename.
+idf_build_get_property(lx_components BUILD_COMPONENTS)
+if("lv_draw_ortho" IN_LIST lx_components)
+    set(lx_ortho_component lv_draw_ortho)
+elseif("youkorr__lv_draw_ortho" IN_LIST lx_components)
+    set(lx_ortho_component youkorr__lv_draw_ortho)
+else()
+    message(FATAL_ERROR "Ortho external component not found in BUILD_COMPONENTS")
+endif()
+idf_component_get_property(ortho_lib ${lx_ortho_component} COMPONENT_LIB)
+message(STATUS "Ortho component: ${lx_ortho_component}")
 target_compile_definitions(${ortho_lib} PUBLIC LV_DRAW_ORTHO_TILE_BYTES=32768)
