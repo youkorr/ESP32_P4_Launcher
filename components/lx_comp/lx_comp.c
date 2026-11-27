@@ -48,6 +48,24 @@ static size_t s_yuv_size;
 static lx_surface_t *s_surface;           /* v1: one surface at a time */
 static bool s_fb_clean[2];                /* fb holds only black outside the surface rect */
 static int s_dw, s_dh;                    /* landscape display size */
+static lx_comp_perf_t s_perf; /* all accesses under s_lock */
+
+bool lx_comp_perf_snapshot(lx_comp_perf_t *out)
+{
+    if (!out || !s_lock || xSemaphoreTake(s_lock, 0) != pdTRUE) return false;
+    *out = s_perf;
+    xSemaphoreGive(s_lock);
+    return true;
+}
+
+static bool wait_flip_measured(void)
+{
+    int64_t start = esp_timer_get_time();
+    bool ok = bsp_display_wait_flip(FLIP_WAIT_MS);
+    s_perf.flip_wait_us += esp_timer_get_time() - start;
+    if (!ok) ++s_perf.flip_timeouts;
+    return ok;
+}
 
 /* Async present: the worker waits for the flip, scales with the PPA and flips while the app
  * goes on with its next frame. One frame in flight: s_idle is taken by the presenter when it
@@ -498,8 +516,9 @@ static esp_err_t present_job(lx_surface_t *s, const void *src)
 {
     const bsp_info_t *b = bsp_info();
     int64_t t_w = esp_timer_get_time();
-    bsp_display_wait_flip(FLIP_WAIT_MS);
+    bool retired = wait_flip_measured();
     s->t_wait += esp_timer_get_time() - t_w;
+    if (!retired) return ESP_ERR_TIMEOUT;
     int back = bsp_display_visible() ^ 1;
     uint16_t *fb = bsp_display_fb(back);
     size_t fb_bytes = (size_t)b->display_w * b->display_h * 2;
@@ -537,12 +556,18 @@ static esp_err_t present_job(lx_surface_t *s, const void *src)
     int64_t t0 = esp_timer_get_time();
     esp_err_t err = ppa_do_scale_rotate_mirror(s_srm, &op);
     int64_t t1 = esp_timer_get_time();
+    s_perf.ppa_us += t1 - t0;
     if (err == ESP_OK) {
-        bsp_display_show(back);
-        if (s->frames++ == 0) s->t_first = t1;
-        s->t_ppa += t1 - t0;
-    } else {
-        ESP_LOGE(TAG, "PPA SRM failed: %s", esp_err_to_name(err));
+        err = bsp_display_show(back);
+        if (err == ESP_OK) {
+            ++s_perf.app_frames;
+            if (s->frames++ == 0) s->t_first = t1;
+            s->t_ppa += t1 - t0;
+        }
+    }
+    if (err != ESP_OK) {
+        ++s_perf.present_errors;
+        ESP_LOGE(TAG, "app present failed: %s", esp_err_to_name(err));
     }
     return err;
 }
@@ -567,7 +592,19 @@ static esp_err_t present_pixels(lx_surface_t *s, const void *pixels)
         goto fail;                                      /* not queued: release both */
     }
     const void *src = s->buf[s->cur];
-    if (pixels) memcpy(s->buf[s->cur], pixels, (size_t)s->w * s->h * 2);   /* the driver writes it back */
+    if (pixels) {
+        size_t bytes = (size_t)s->w * s->h * 2;
+        if (pixels == src) {
+            /* Caller passed the current surface buffer: ownership already
+             * transfers to the worker, so a self-copy is unnecessary. */
+            s_perf.skipped_copy_bytes += bytes;
+        } else {
+            int64_t start = esp_timer_get_time();
+            memcpy(s->buf[s->cur], pixels, bytes);
+            s_perf.copy_us += esp_timer_get_time() - start;
+            s_perf.copy_bytes += bytes;
+        }
+    }
     s->cur = (s->cur + 1) % s->nbuf;
     s_job.s = s;
     s_job.src = src;
@@ -602,7 +639,10 @@ esp_err_t lx_comp_launcher_present(const uint16_t *frame)
     const bsp_info_t *b = bsp_info();
     size_t bytes = (size_t)s_dw * s_dh * 2;
     esp_cache_msync((void *)frame, bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-    bsp_display_wait_flip(FLIP_WAIT_MS);
+    if (!wait_flip_measured()) {
+        xSemaphoreGive(s_lock);
+        return ESP_ERR_TIMEOUT;
+    }
     int back = bsp_display_visible() ^ 1;
     uint16_t *fb = bsp_display_fb(back);
     ppa_srm_oper_config_t op = {
@@ -625,12 +665,17 @@ esp_err_t lx_comp_launcher_present(const uint16_t *frame)
         .scale_y = 1.0f,
         .mode = PPA_TRANS_MODE_BLOCKING,
     };
+    int64_t start = esp_timer_get_time();
     esp_err_t err = ppa_do_scale_rotate_mirror(s_srm, &op);
+    s_perf.ppa_us += esp_timer_get_time() - start;
     if (err == ESP_OK) {
         s_fb_clean[back] = false;
-        bsp_display_show(back);
-    } else {
-        ESP_LOGE(TAG, "launcher present: PPA SRM failed: %s", esp_err_to_name(err));
+        err = bsp_display_show(back);
+        if (err == ESP_OK) ++s_perf.home_frames;
+    }
+    if (err != ESP_OK) {
+        ++s_perf.present_errors;
+        ESP_LOGE(TAG, "launcher present failed: %s", esp_err_to_name(err));
     }
     xSemaphoreGive(s_lock);
     return err;
@@ -643,7 +688,7 @@ esp_err_t lx_comp_launcher_present_native(const uint16_t *frame)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     esp_err_t err = ESP_ERR_INVALID_STATE;
     if (s_surface || bsp_display_fb_count() != 2) goto done;
-    if (!bsp_display_wait_flip(FLIP_WAIT_MS)) {
+    if (!wait_flip_measured()) {
         err = ESP_ERR_TIMEOUT;
         goto done; /* never write after a failed retirement wait */
     }
@@ -656,10 +701,15 @@ esp_err_t lx_comp_launcher_present_native(const uint16_t *frame)
     size_t bytes = (size_t)b->display_w * b->display_h * 2;
     /* PPA writes to the private buffer have finished before flush. Its
      * driver maintains source/destination cache coherence. */
+    int64_t start = esp_timer_get_time();
     memcpy(fb, frame, bytes);
+    s_perf.copy_us += esp_timer_get_time() - start;
+    s_perf.copy_bytes += bytes;
     s_fb_clean[back] = false;
     err = esp_cache_msync(fb, bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
     if (err == ESP_OK) err = bsp_display_show(back);
+    if (err == ESP_OK) ++s_perf.home_frames;
+    else ++s_perf.present_errors;
 done:
     xSemaphoreGive(s_lock);
     return err;
@@ -690,7 +740,10 @@ static uint16_t *launcher_begin(bool over_app)
         xSemaphoreGive(s_lock);
         return NULL;
     }
-    bsp_display_wait_flip(FLIP_WAIT_MS);
+    if (!wait_flip_measured()) {
+        xSemaphoreGive(s_lock);
+        return NULL;
+    }
     int back = bsp_display_visible() ^ 1;
     s_fb_clean[back] = false;           /* the app's next present redraws the letterbox */
     return bsp_display_fb(back);
@@ -768,6 +821,7 @@ void lx_comp_launcher_end(void)
     int back = bsp_display_visible() ^ 1;
     esp_cache_msync(bsp_display_fb(back), (size_t)b->display_w * b->display_h * 2,
                     ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-    bsp_display_show(back);
+    if (bsp_display_show(back) == ESP_OK) ++s_perf.overlay_frames;
+    else ++s_perf.present_errors;
     xSemaphoreGive(s_lock);
 }

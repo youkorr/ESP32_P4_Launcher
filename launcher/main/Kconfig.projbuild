@@ -5,4 +5,11 @@ config LX_USE_ORTHO
     help
         Use the external registry component with a private native-orientation
         RGB565 buffer. The compositor still owns the panel. Not a release.
+config LX_ORTHO_TWO_CORES
+    bool "Experimental second Ortho render core"
+    depends on LX_USE_ORTHO && LV_OS_FREERTOS
+    default n
+    help
+        Attempt to enable the helper only if the internal heap reserve permits.
+        Requires hardware measurement; one core remains the default.
 endmenu

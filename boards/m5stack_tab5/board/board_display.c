@@ -6,6 +6,7 @@
  */
 #include "board_internal.h"
 #include "board_pins.h"
+#include "fb_fence.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -30,14 +31,17 @@ static const char *TAG = "bsp_disp";
 
 static esp_lcd_panel_handle_t s_panel;
 static uint16_t *s_fbs[NUM_FBS];
-static int s_visible;
-static volatile bool s_flip_pending;
+static lx_fb_fence_t s_fence;
+static portMUX_TYPE s_fence_lock = portMUX_INITIALIZER_UNLOCKED;
 static SemaphoreHandle_t s_vsync;
 
 static bool IRAM_ATTR on_refresh_done(esp_lcd_panel_handle_t panel, esp_lcd_dpi_panel_event_data_t *edata,
                                       void *user_ctx)
 {
     BaseType_t woken = pdFALSE;
+    portENTER_CRITICAL_ISR(&s_fence_lock);
+    lx_fb_completed(&s_fence);
+    portEXIT_CRITICAL_ISR(&s_fence_lock);
     xSemaphoreGiveFromISR(s_vsync, &woken);
     return woken == pdTRUE;
 }
@@ -215,8 +219,10 @@ esp_err_t bsp_display_init(void)
     s_fbs[1] = fb1;
 
     s_vsync = xSemaphoreCreateBinary();
-    esp_lcd_dpi_panel_event_callbacks_t cbs = { .on_refresh_done = on_refresh_done };
-    esp_lcd_dpi_panel_register_event_callbacks(s_panel, &cbs, NULL);
+    if (!s_vsync) return ESP_ERR_NO_MEM;
+    esp_lcd_dpi_panel_event_callbacks_t cbs = { .on_frame_buf_complete = on_refresh_done };
+    ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_register_event_callbacks(s_panel, &cbs, NULL),
+                        TAG, "frame completion callback");
 
     size_t bytes = BOARD_LCD_H_RES * BOARD_LCD_V_RES * 2;
     for (int i = 0; i < NUM_FBS; i++) {
@@ -244,26 +250,42 @@ uint16_t *bsp_display_fb(int index)
 esp_err_t bsp_display_show(int index)
 {
     if (!s_panel || index < 0 || index >= NUM_FBS) return ESP_ERR_INVALID_ARG;
+    portENTER_CRITICAL(&s_fence_lock);
+    bool allowed = index == s_fence.visible || lx_fb_writable(&s_fence, index);
+    portEXIT_CRITICAL(&s_fence_lock);
+    if (!allowed) return ESP_ERR_INVALID_STATE;
     esp_err_t err = esp_lcd_panel_draw_bitmap(s_panel, 0, 0, BOARD_LCD_H_RES, BOARD_LCD_V_RES, s_fbs[index]);
     if (err == ESP_OK) {
-        s_visible = index;
-        xSemaphoreTake(s_vsync, 0);
-        s_flip_pending = true;
+        portENTER_CRITICAL(&s_fence_lock);
+        lx_fb_submitted(&s_fence, index);
+        portEXIT_CRITICAL(&s_fence_lock);
     }
     return err;
 }
 
 bool bsp_display_wait_flip(uint32_t timeout_ms)
 {
-    if (!s_flip_pending) return true;
-    bool ok = xSemaphoreTake(s_vsync, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
-    if (ok) s_flip_pending = false;
-    return ok;
+    if (!s_vsync) return false;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t limit = pdMS_TO_TICKS(timeout_ms);
+    for (;;) {
+        portENTER_CRITICAL(&s_fence_lock);
+        bool ready = lx_fb_writable(&s_fence, s_fence.visible ^ 1);
+        portEXIT_CRITICAL(&s_fence_lock);
+        if (ready) return true;
+        if ((TickType_t)(xTaskGetTickCount() - start) >= limit) return false;
+        /* The semaphore is only a wake hint; a concurrent vsync waiter
+         * cannot consume proof of retirement. Poll the epoch every tick. */
+        xSemaphoreTake(s_vsync, 1);
+    }
 }
 
 int bsp_display_visible(void)
 {
-    return s_visible;
+    portENTER_CRITICAL(&s_fence_lock);
+    int index = s_fence.visible;
+    portEXIT_CRITICAL(&s_fence_lock);
+    return index;
 }
 
 bool bsp_display_wait_vsync(uint32_t timeout_ms)

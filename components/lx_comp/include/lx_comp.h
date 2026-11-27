@@ -35,6 +35,15 @@ typedef struct {
 
 esp_err_t lx_comp_init(void);
 
+/* Diagnostics, not part of the PAPP ABI. Counts accepted submissions, not
+ * verified optical FPS. Snapshot is nonblocking; retry if busy. */
+typedef struct {
+    uint64_t home_frames, app_frames, overlay_frames;
+    uint64_t flip_wait_us, ppa_us, copy_us, copy_bytes, skipped_copy_bytes;
+    uint64_t flip_timeouts, present_errors;
+} lx_comp_perf_t;
+bool lx_comp_perf_snapshot(lx_comp_perf_t *out);
+
 /* Display size as seen by apps (landscape, rotation already applied). */
 void lx_comp_display_size(int *w, int *h);
 

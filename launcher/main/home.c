@@ -64,6 +64,9 @@
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+#include "freertos/idf_additions.h"
+#endif
 
 static const char *TAG = "home";
 
@@ -3112,10 +3115,84 @@ static void autostart_tick(void)
     snprintf(s_launch, sizeof(s_launch), "%s", s_auto);
 }
 
+/* Ten-second interval counters, sampled even when an app owns the screen.
+ * Submission rates are not physical scanout FPS. Idle deltas approximate
+ * CPU utilization when FreeRTOS runtime stats use the microsecond timer. */
+static void perf_tick(void)
+{
+    static int64_t last;
+    static lx_comp_perf_t prev;
+#if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS && CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER
+    static configRUN_TIME_COUNTER_TYPE idle[2];
+#endif
+    int64_t now = esp_timer_get_time();
+    if (last && now - last < 10000000) return;
+    lx_comp_perf_t st;
+    if (!lx_comp_perf_snapshot(&st)) return;
+#if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS && CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER
+    configRUN_TIME_COUNTER_TYPE cur[2] = {
+        ulTaskGetIdleRunTimeCounterForCore(0), ulTaskGetIdleRunTimeCounterForCore(1)
+    };
+    if (last) {
+        double c0 = 100.0 * (1.0 - (configRUN_TIME_COUNTER_TYPE)(cur[0] - idle[0]) / (double)(now - last));
+        double c1 = 100.0 * (1.0 - (configRUN_TIME_COUNTER_TYPE)(cur[1] - idle[1]) / (double)(now - last));
+        ESP_LOGI("lx_perf", "CPU busy approx: core0 %.1f%% core1 %.1f%%",
+                 c0 < 0 ? 0 : c0 > 100 ? 100 : c0, c1 < 0 ? 0 : c1 > 100 ? 100 : c1);
+    }
+    idle[0] = cur[0]; idle[1] = cur[1];
+#endif
+    if (last) {
+        double sec = (now - last) / 1e6;
+        ESP_LOGI("lx_perf", "submitted/s home %.1f app %.1f overlay %.1f; PPA %.1f ms/s; flip wait %.1f ms/s",
+                 (st.home_frames-prev.home_frames)/sec, (st.app_frames-prev.app_frames)/sec,
+                 (st.overlay_frames-prev.overlay_frames)/sec, (st.ppa_us-prev.ppa_us)/1000.0/sec,
+                 (st.flip_wait_us-prev.flip_wait_us)/1000.0/sec);
+        ESP_LOGI("lx_perf", "copy %.1f KiB/s %.1f ms/s; skipped %.1f KiB/s; timeouts %llu errors %llu",
+                 (st.copy_bytes-prev.copy_bytes)/1024.0/sec, (st.copy_us-prev.copy_us)/1000.0/sec,
+                 (st.skipped_copy_bytes-prev.skipped_copy_bytes)/1024.0/sec,
+                 (unsigned long long)(st.flip_timeouts-prev.flip_timeouts),
+                 (unsigned long long)(st.present_errors-prev.present_errors));
+        const uint32_t caps[] = {MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT};
+        for (int i = 0; i < 2; ++i)
+            ESP_LOGI("lx_perf", "%s free/min/largest %u/%u/%u KiB",
+                     i ? "PSRAM" : "SRAM",
+                     (unsigned)(heap_caps_get_free_size(caps[i])/1024),
+                     (unsigned)(heap_caps_get_minimum_free_size(caps[i])/1024),
+                     (unsigned)(heap_caps_get_largest_free_block(caps[i])/1024));
+#ifdef CONFIG_LX_USE_ORTHO
+        if (s_ortho) {
+            const lv_draw_ortho_stats_t *o = lv_draw_ortho_get_stats();
+            ESP_LOGI("lx_perf", "Ortho cores %u tiles %lu other-core %lu internal %u turner-failed %u",
+                     (unsigned)o->cores, (unsigned long)o->tiles, (unsigned long)o->tiles_other_core,
+                     (unsigned)o->tile_internal, (unsigned)o->turner_failed);
+        }
+#endif
+    }
+    prev = st;
+    last = now;
+}
+
 static void home_task(void *arg)
 {
+#ifdef CONFIG_LX_ORTHO_TWO_CORES
+    if (s_ortho && heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 192 * 1024 &&
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 34 * 1024) {
+        ESP_LOGI(TAG, "Ortho second core: %s", lv_draw_ortho_set_cores(2) ? "enabled" : "unavailable");
+    } else if (s_ortho) {
+        ESP_LOGW(TAG, "Ortho second core disabled: SRAM reserve");
+    }
+#endif
     bool was_running = false, confirmed = false, offered = false;
     for (;;) {
+        perf_tick();
+#ifdef CONFIG_LX_USE_ORTHO
+        /* No explicit lv_refr_now paths after a detected DMA fault either.
+         * Do not confirm an experimental boot or reuse the private buffer. */
+        if (s_ortho_fault) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+#endif
         if (!confirmed && esp_timer_get_time() > CONFIRM_AFTER_US) {
             lx_update_confirm();
             confirmed = true;

@@ -58,3 +58,32 @@ requires reset. This prototype does not change the original BSP's retirement
 semantics, which still require board validation. The game PPA path and ABI
 are unchanged. No speedup or hardware reliability is claimed. CI builds
 both configurations on all seven boards and tests coordinate round trips.
+
+## Stage 3 — performance safeguards and measurement (ortho-performance)
+
+The Tab5 BSP now counts DMA completions using on_frame_buf_complete and
+tracks the retirement epoch of each of the two buffers. It requires two
+later callbacks after successful submission, conservatively avoiding a
+stale binary semaphore or callback racing with submission. This is a
+model based on ESP-IDF 5.5.6's DPI driver, not proof of physical timing.
+It may increase flip wait and decrease FPS; measure before tuning it.
+All compositor retirement waits now check their result; no write after
+a timeout. Count successful submissions rather than ignored show errors.
+Other BSP retirement semantics remain unchanged. DevLink screenshot
+ownership and all hardware behavior still need validation.
+
+Diagnostics every ten seconds: successful home/app/overlay submissions,
+measured PPA and flip time, explicitly instrumented copies and avoided
+self-copies, timeout/error counts, free/min/largest SRAM and PSRAM, and
+Ortho tile/core counters. CPU busy is approximate when FreeRTOS runtime
+stats use esp_timer; these are enabled by CI. Submission rates are not
+optically measured FPS. Second core is a separate opt-in with a conservative
+SRAM check. The PAPP ABI and external engine version are unchanged.
+
+Zero-copy native LVGL, third framebuffer, shared PPA scheduling/bounded
+SRM for game scaling, and eliminating external-frame copies with changed
+ownership contracts are intentionally not implemented here. In particular,
+existing blocking game PPA operations remain; a stuck PPA requires reset.
+Do not share LVGL buffers with games until a full render lease and app
+handoff (including DevLink starts, overlays, screenshots and errors) have
+been tested. No OTA release or performance claims before hardware A/B.
