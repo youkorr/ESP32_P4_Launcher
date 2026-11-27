@@ -28,4 +28,11 @@ config LX_ORTHO_DIRECT
         Retain the FULL mode as a reference. Synchronize only stale native
         tiles before rendering changed LVGL regions. Rebootstrap with a
         full redraw after app/overlay ownership changes or failed frames.
+config LX_ORTHO_LIFECYCLE
+    bool "Experimental Ortho resource suspension before app load"
+    depends on LX_ORTHO_DIRECT
+    default n
+    help
+        Requires experimental engine API staged with tools/stage_ortho_lifecycle.sh.
+        Suspend before allocating PAPP_FAST; resume on return or load failure.
 endmenu

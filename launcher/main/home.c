@@ -103,6 +103,9 @@ static lv_display_t *s_disp;
 static uint16_t *s_frame;
 #ifdef CONFIG_LX_USE_ORTHO
 static bool s_ortho, s_ortho_pending, s_ortho_fault;
+#ifdef CONFIG_LX_ORTHO_LIFECYCLE
+static bool s_ortho_suspended;
+#endif
 #ifdef CONFIG_LX_ORTHO_NATIVE
 static bool s_native, s_native_lease, s_native_drawn, s_native_retry;
 static uint16_t *s_native_target;
@@ -118,6 +121,9 @@ static void home_refr_now(lv_display_t *disp)
 {
 #ifdef CONFIG_LX_USE_ORTHO
     if (s_ortho_fault) return;
+#ifdef CONFIG_LX_ORTHO_LIFECYCLE
+    if (s_ortho_suspended) return;
+#endif
 #endif
     lv_refr_now(disp);
 }
@@ -2703,8 +2709,7 @@ static bool ortho_prepare(int w, int h)
     }
     lv_draw_ortho_init();
     if (lv_draw_ortho_ppa_init() != ESP_OK) {
-        ESP_LOGW(TAG, "Ortho disabled: PPA client unavailable");
-        return false;
+        ESP_LOGW(TAG, "Ortho running CPU only: PPA client unavailable");
     }
     ESP_LOGI(TAG, "Ortho experimental private buffer, single core; SRAM free=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
@@ -3281,7 +3286,7 @@ static void perf_tick(void)
     last = now;
 }
 
-static void home_task(void *arg)
+static void ortho_try_second_core(void)
 {
 #ifdef CONFIG_LX_ORTHO_TWO_CORES
     if (s_ortho && heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 192 * 1024 &&
@@ -3291,8 +3296,59 @@ static void home_task(void *arg)
         ESP_LOGW(TAG, "Ortho second core disabled: SRAM reserve");
     }
 #endif
+}
+
+#ifdef CONFIG_LX_ORTHO_LIFECYCLE
+/* Called under the recursive launch gate, before the loader allocates FAST.
+ * No LVGL rendering or other home API call can overlap this transition. */
+static bool ortho_before_app(void)
+{
+    if (!s_ortho) return true;
+    if (s_ortho_fault) return false;
+    if (s_ortho_suspended) return true;
+    size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!lv_draw_ortho_ppa_suspend() || !lv_draw_ortho_suspend()) {
+        s_ortho_fault = true;
+        ESP_LOGE(TAG, "Ortho suspend failed; refuse app launch, reset required");
+        return false;
+    }
+    s_ortho_suspended = true;
+    s_ortho_pending = false;
+    size_t after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    ESP_LOGI("lx_perf", "Ortho suspended before FAST: internal %u -> %u bytes",
+             (unsigned)before,(unsigned)after);
+    return true;
+}
+
+/* Called only by home task, after app teardown / failed load. On allocation
+ * failure stay suspended; retry without calling LVGL or using freed tiles. */
+static bool ortho_resume_home(void)
+{
+    if (!s_ortho_suspended) return true;
+    if (!lv_draw_ortho_resume()) return false;
+    s_ortho_suspended = false;
+    if (lv_draw_ortho_ppa_init() != ESP_OK)
+        ESP_LOGW(TAG, "Ortho resumed with CPU only: PPA client unavailable");
+    ortho_try_second_core();
+#ifdef CONFIG_LX_ORTHO_DIRECT
+    s_direct_force_full = true;
+#endif
+    lv_obj_invalidate(lv_screen_active());
+    ESP_LOGI("lx_perf", "Ortho resumed: SRAM %u bytes, cores %u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)lv_draw_ortho_get_stats()->cores);
+    return true;
+}
+#endif
+
+static void home_task(void *arg)
+{
+    lx_app_gate_enter();
+    if (lx_app_state() == LX_APP_IDLE) ortho_try_second_core();
+    lx_app_gate_leave();
     bool was_running = false, confirmed = false, offered = false;
     for (;;) {
+        lx_app_gate_enter();
         perf_tick();
 #ifdef CONFIG_LX_ORTHO_NATIVE
         if (s_native_retry && !s_ortho_fault && lx_app_state() == LX_APP_IDLE) {
@@ -3304,6 +3360,7 @@ static void home_task(void *arg)
         /* No explicit lv_refr_now paths after a detected DMA fault either.
          * Do not confirm an experimental boot or reuse the private buffer. */
         if (s_ortho_fault) {
+            lx_app_gate_leave();
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
@@ -3323,9 +3380,17 @@ static void home_task(void *arg)
                 if (p[0] && strcmp(p, s_last) != 0) remember_last(p);
             }
             was_running = true;
+            lx_app_gate_leave();
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
+#ifdef CONFIG_LX_ORTHO_LIFECYCLE
+        if (!ortho_resume_home()) {
+            lx_app_gate_leave();
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+#endif
         if (was_running) {                      /* back from an app: redraw everything */
 #ifdef CONFIG_LX_ORTHO_DIRECT
             s_direct_force_full = true;
@@ -3390,8 +3455,10 @@ static void home_task(void *arg)
             snprintf(path, sizeof(path), "%s", s_launch);
             s_launch[0] = 0;
             launch(path);
+            lx_app_gate_leave();
             continue;
         }
+        lx_app_gate_leave();
         vTaskDelay(pdMS_TO_TICKS(wait < 5 ? 5 : wait > 20 ? 20 : wait));
     }
 }
@@ -3417,11 +3484,12 @@ esp_err_t home_start(void)
     s_frame = heap_caps_aligned_alloc(64, bytes, MALLOC_CAP_SPIRAM);
     if (!s_frame) return ESP_ERR_NO_MEM;
 
+    lx_app_gate_enter();
     lv_init();
     lv_tick_set_cb(tick_ms);
     int draw_w = w, draw_h = h_px;
 #ifdef CONFIG_LX_USE_ORTHO
-    s_ortho = ortho_prepare(w, h_px);
+    s_ortho = lx_app_state() == LX_APP_IDLE && ortho_prepare(w, h_px);
     if (s_ortho) {
         draw_w = bsp_info()->display_w;
         draw_h = bsp_info()->display_h;
@@ -3482,7 +3550,12 @@ esp_err_t home_start(void)
     show_crash_notice();
     autostart_begin();
 
-    xTaskCreatePinnedToCore(home_task, "home", 8192, NULL, 4, NULL, 0);
+#ifdef CONFIG_LX_ORTHO_LIFECYCLE
+    lx_app_set_before_load(ortho_before_app);
+#endif
+    BaseType_t started = xTaskCreatePinnedToCore(home_task, "home", 8192, NULL, 4, NULL, 0);
+    lx_app_gate_leave();
+    if (started != pdPASS) return ESP_ERR_NO_MEM;
     ESP_LOGI(TAG, "home screen up, %d apps", s_ninstalled);
     return ESP_OK;
 }

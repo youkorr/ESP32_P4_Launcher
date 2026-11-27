@@ -40,6 +40,11 @@ typedef struct {
 } lx_app_crash_ctx_t;
 
 esp_err_t lx_app_init(lx_app_log_sink_t log_sink, lx_app_exit_cb_t exit_cb);
+/* Internal launcher/loader gate, not PAPP ABI. Register callback under gate.
+ * Callback runs before FAST image allocation for every launch source. */
+void lx_app_gate_enter(void);
+void lx_app_gate_leave(void);
+void lx_app_set_before_load(bool (*cb)(void));
 
 /* First thing at boot: takes the P4's slow low-power RAM out of the heap, so no internal
  * allocation can land there; apps get it only with PAPP_MEM_LPRAM (lx_lpram.c). */

@@ -134,3 +134,19 @@ allocated. Host tests compare reconstructed complete frames pixel-for-pixel
 against a reference under changes, cancellations, foreign writes, and retirement
 waits. They do not validate physical DMA cache coherence or real-time scheduling.
 The blocking game PPA paths remain unchanged. No release before board tests.
+
+## Stage 6 — resource lifecycle (experimental)
+
+Engine source is external and pinned to 5defd2243d8b4ec7e5391fb2084d61b157c09e8c.
+Run bash tools/stage_ortho_lifecycle.sh on a clean checkout before enabling
+CONFIG_LX_ORTHO_LIFECYCLE. Ordinary builds retain registry 0.2.0 unchanged.
+The recursive launch gate serializes all launch sources with home rendering,
+including DevLink and app relaunch. Suspend drains PPA/GDMA before releasing
+Ortho tiles and helper tasks, before PAPP_FAST allocation. On failed load or
+app exit resume on the home task with one tile, optional hardware/helper,
+full bootstrap of DIRECT history. Allocation failure leaves home suspended
+and retries; DMA fault refuses launch. No new PAPP ABI. No registry upload.
+The main home task gate spans a UI iteration; its impact on launch latency
+and lock ordering, helper-task reclamation, SRAM fragmentation, and audio
+must be tested on hardware. The third native framebuffer and scratch remain
+allocated. Game PPA remains blocking in its worker. A3D is not integrated.

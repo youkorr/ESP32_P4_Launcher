@@ -73,6 +73,8 @@ static QueueHandle_t             s_queue;
 static lx_app_exit_cb_t          s_exit_cb;
 static volatile bool              s_relaunching;  /* between teardown and the relaunch */
 static char                      s_cur_path[128];
+static SemaphoreHandle_t s_launch_gate;
+static bool (*s_before_load)(void);
 static volatile uint32_t         s_run;          /* tags MSG_EXITED so a late one can't end the next run */
 
 /* Survives a panic reboot so the next boot can say which app crashed and where. */
@@ -449,12 +451,14 @@ static char **build_argv(const char *path, int argc, const char *const *argv, in
     return v;
 }
 
-esp_err_t lx_app_launch(const char *path, int argc, const char *const *argv,
+static esp_err_t app_launch_locked(const char *path, int argc, const char *const *argv,
                         char *err, size_t err_len)
 {
     if (s_state != LX_APP_IDLE)
         return fail(err, err_len, ESP_ERR_INVALID_STATE, "an app is already running");
 
+    if (s_before_load && !s_before_load())
+        return fail(err, err_len, ESP_ERR_INVALID_STATE, "graphics resources not quiescent");
     lx_lpram_sweep();           /* low-power RAM IDF gave back (main task stack): never for the app's own memory */
     app_t *a = calloc(1, sizeof(*a));
     if (!a) return fail(err, err_len, ESP_ERR_NO_MEM, "out of memory");
@@ -498,6 +502,22 @@ esp_err_t lx_app_launch(const char *path, int argc, const char *const *argv,
     a->task = xTaskCreateStaticPinnedToCore(app_task, "papp_main", stack / sizeof(StackType_t),
                                             a, APP_TASK_PRIO, a->stack, a->tcb, APP_TASK_CORE);
     return ESP_OK;
+}
+
+/* All launch sources (home, DevLink, relaunch) take the same recursive gate.
+ * The home task holds it during LVGL callbacks and resource transitions. */
+void lx_app_gate_enter(void) { xSemaphoreTakeRecursive(s_launch_gate, portMAX_DELAY); }
+void lx_app_gate_leave(void) { xSemaphoreGiveRecursive(s_launch_gate); }
+void lx_app_set_before_load(bool (*cb)(void)) { s_before_load = cb; }
+
+esp_err_t lx_app_launch(const char *path, int argc, const char *const *argv,
+                        char *err, size_t err_len)
+{
+    if (!s_launch_gate) return ESP_ERR_INVALID_STATE;
+    lx_app_gate_enter();
+    esp_err_t e = app_launch_locked(path,argc,argv,err,err_len);
+    lx_app_gate_leave();
+    return e;
 }
 
 bool lx_app_fast_sram(uintptr_t *base, size_t *size)
@@ -625,6 +645,8 @@ esp_err_t lx_app_init(lx_app_log_sink_t log_sink, lx_app_exit_cb_t exit_cb)
     }
     s_crash_rec.magic = 0;
 
+    s_launch_gate = xSemaphoreCreateRecursiveMutex();
+    if (!s_launch_gate) return ESP_ERR_NO_MEM;
     s_exit_cb = exit_cb;
     lx_svc_init(log_sink);
     s_queue = xQueueCreate(4, sizeof(msg_t));
