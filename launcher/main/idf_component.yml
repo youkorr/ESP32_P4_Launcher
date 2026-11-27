@@ -1,3 +1,4 @@
 dependencies:
-  lvgl/lvgl: "9.2.2"
+  lvgl/lvgl: "9.6.0"
+  youkorr/lv_draw_ortho: "0.2.0"
 

@@ -49,6 +49,11 @@
 #include <time.h>
 #include <unistd.h>
 #include "lvgl.h"
+#ifdef CONFIG_LX_USE_ORTHO
+#include "lv_draw_ortho.h"
+#include "lv_draw_ortho_ppa.h"
+#include "ortho_coords.h"
+#endif
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -93,6 +98,9 @@ static char s_last[160];        /* last launched .papp */
 
 static lv_display_t *s_disp;
 static uint16_t *s_frame;
+#ifdef CONFIG_LX_USE_ORTHO
+static bool s_ortho, s_ortho_pending, s_ortho_fault;
+#endif
 static lv_obj_t *s_home, *s_settings;
 static lv_obj_t *s_clk_area;            /* home clock: opens the clock setup (every board) */
 static void on_clk_open(lv_event_t *ev);
@@ -2633,10 +2641,68 @@ static uint32_t tick_ms(void)
     return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
+#ifdef CONFIG_LX_USE_ORTHO
+/* The home buffer is private even if DevLink starts an app during rendering.
+ * Only the compositor may copy it into a hidden panel buffer. */
+static void ortho_present(void)
+{
+    if (!s_ortho || !s_ortho_pending || s_ortho_fault ||
+        lx_app_state() != LX_APP_IDLE) return;
+    if (lv_draw_ortho_ppa_stuck() || lv_draw_ortho_get_stats()->turner_failed) {
+        /* A timed-out DMA transaction is not a completed frame. Never hand
+         * it to scanout. Recovery of the hardware requires a reset. */
+        s_ortho_fault = true;
+        ESP_LOGE(TAG, "Ortho PPA fault; restart with original renderer");
+        return;
+    }
+    esp_err_t err = lx_comp_launcher_present_native(s_frame);
+    if (err == ESP_OK) s_ortho_pending = false;
+}
+
+static bool ortho_prepare(int w, int h)
+{
+    const bsp_info_t *b = bsp_info();
+    /* First trial only on the known rotated DSI board. Other BSPs are
+     * deliberately unchanged until a board owner has tested them. */
+    if (strcmp(b->id, "m5stack_tab5") != 0 ||
+        (b->display_rot != 90 && b->display_rot != 270) ||
+        w != b->display_h || h != b->display_w ||
+        bsp_display_fb_count() != 2 ||
+        lv_draw_buf_width_to_stride(b->display_w, LV_COLOR_FORMAT_RGB565) !=
+            (uint32_t)b->display_w * 2)
+        return false;
+    /* One core, two 32 KiB tiles at most; leave headroom for app FAST code,
+     * hosted Wi-Fi, audio and USB. This is a conservative gate, not a
+     * measured guarantee of enough SRAM on hardware. */
+    size_t free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (free < 160 * 1024 || largest < 34 * 1024) {
+        ESP_LOGW(TAG, "Ortho disabled: internal free=%u largest=%u",
+                 (unsigned)free, (unsigned)largest);
+        return false;
+    }
+    lv_draw_ortho_init();
+    if (lv_draw_ortho_ppa_init() != ESP_OK) {
+        ESP_LOGW(TAG, "Ortho disabled: PPA client unavailable");
+        return false;
+    }
+    ESP_LOGI(TAG, "Ortho experimental private buffer, single core; SRAM free=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    return true;
+}
+#endif
+
 static void flush_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px)
 {
-    if (lv_display_flush_is_last(d) && lx_app_state() == LX_APP_IDLE)
-        lx_comp_launcher_present(s_frame);
+    if (lv_display_flush_is_last(d) && lx_app_state() == LX_APP_IDLE) {
+#ifdef CONFIG_LX_USE_ORTHO
+        if (s_ortho) {
+            s_ortho_pending = true;
+            ortho_present();
+        } else
+#endif
+            lx_comp_launcher_present(s_frame);
+    }
     lv_display_flush_ready(d);
 }
 
@@ -2674,6 +2740,17 @@ static void touch_read(lv_indev_t *indev, lv_indev_data_t *data)
     if ((bsp_info()->caps & BSP_CAP_TOUCH) && bsp_touch_read(p, 1) > 0) {
         data->point.x = p[0].x;
         data->point.y = p[0].y;
+#ifdef CONFIG_LX_USE_ORTHO
+        if (s_ortho) {
+            const bsp_info_t *b = bsp_info();
+            /* BSP points are already landscape. LVGL expects native input
+             * and applies the inverse of its render rotation itself. */
+            lx_ortho_point_t point = lx_ortho_native_point(
+                b->display_rot, b->display_w, b->display_h, p[0].x, p[0].y);
+            data->point.x = point.x;
+            data->point.y = point.y;
+        }
+#endif
         data->state = LV_INDEV_STATE_PRESSED;
         s_last_input = esp_timer_get_time();
     } else {
@@ -3098,7 +3175,16 @@ static void home_task(void *arg)
             if (e) snprintf(keep, sizeof(keep), "%s", e->path);
             home_view(keep[0] ? keep : NULL);
         }
-        uint32_t wait = lv_timer_handler();
+        uint32_t wait = 20;
+#ifdef CONFIG_LX_USE_ORTHO
+        /* Do not draw over potentially outstanding DMA after a PPA fault.
+         * Input/DevLink and the original app manager remain independent. */
+        if (!s_ortho_fault)
+#endif
+            wait = lv_timer_handler();
+#ifdef CONFIG_LX_USE_ORTHO
+        ortho_present();
+#endif
         if (s_back_draws && --s_back_draws == 0) s_touch_quiet_until = esp_timer_get_time() + BACK_QUIET_US;
         if (s_upd_online) upd_online_tick();
         else upd_bg_tick();
@@ -3138,9 +3224,24 @@ esp_err_t home_start(void)
 
     lv_init();
     lv_tick_set_cb(tick_ms);
-    s_disp = lv_display_create(w, h_px);
+    int draw_w = w, draw_h = h_px;
+#ifdef CONFIG_LX_USE_ORTHO
+    s_ortho = ortho_prepare(w, h_px);
+    if (s_ortho) {
+        draw_w = bsp_info()->display_w;
+        draw_h = bsp_info()->display_h;
+    }
+#endif
+    s_disp = lv_display_create(draw_w, draw_h);
     lv_display_set_color_format(s_disp, LV_COLOR_FORMAT_RGB565);
     lv_display_set_buffers(s_disp, s_frame, NULL, bytes, LV_DISPLAY_RENDER_MODE_DIRECT);
+#ifdef CONFIG_LX_USE_ORTHO
+    if (s_ortho) {
+        lv_display_set_rotation(s_disp, bsp_info()->display_rot == 90 ?
+            LV_DISPLAY_ROTATION_90 : LV_DISPLAY_ROTATION_270);
+        lv_display_set_matrix_rotation(s_disp, true);
+    }
+#endif
     lv_display_set_flush_cb(s_disp, flush_cb);
     lv_indev_t *touch = lv_indev_create();
     lv_indev_set_type(touch, LV_INDEV_TYPE_POINTER);

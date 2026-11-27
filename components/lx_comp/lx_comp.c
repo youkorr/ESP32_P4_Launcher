@@ -636,6 +636,35 @@ esp_err_t lx_comp_launcher_present(const uint16_t *frame)
     return err;
 }
 
+esp_err_t lx_comp_launcher_present_native(const uint16_t *frame)
+{
+    if (!s_lock || !frame) return ESP_ERR_INVALID_ARG;
+    wait_idle();
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    if (s_surface || bsp_display_fb_count() != 2) goto done;
+    if (!bsp_display_wait_flip(FLIP_WAIT_MS)) {
+        err = ESP_ERR_TIMEOUT;
+        goto done; /* never write after a failed retirement wait */
+    }
+    int visible = bsp_display_visible();
+    if (visible < 0 || visible > 1) goto done;
+    int back = visible ^ 1;
+    uint16_t *fb = bsp_display_fb(back);
+    if (!fb || fb == frame || bsp_display_fb(visible) == frame) goto done;
+    const bsp_info_t *b = bsp_info();
+    size_t bytes = (size_t)b->display_w * b->display_h * 2;
+    /* PPA writes to the private buffer have finished before flush. Its
+     * driver maintains source/destination cache coherence. */
+    memcpy(fb, frame, bytes);
+    s_fb_clean[back] = false;
+    err = esp_cache_msync(fb, bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    if (err == ESP_OK) err = bsp_display_show(back);
+done:
+    xSemaphoreGive(s_lock);
+    return err;
+}
+
 int lx_comp_touch_read(lx_surface_t *s, bsp_touch_point_t *pts, int max)
 {
     if (!s || s != s_surface) return -1;

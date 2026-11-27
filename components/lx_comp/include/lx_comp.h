@@ -88,6 +88,8 @@ uint16_t *lx_comp_takeover_begin(void);
  * 64-byte aligned): rotated onto the panel by the PPA and shown. Does nothing
  * (ESP_ERR_INVALID_STATE) while an app surface owns the display. */
 esp_err_t lx_comp_launcher_present(const uint16_t *frame);
+/* Private native RGB565 frame, tightly packed; copies under compositor ownership. */
+esp_err_t lx_comp_launcher_present_native(const uint16_t *frame);
 /* Copies what is on screen into dst (a buffer from *_begin), to draw on top of it. */
 void      lx_comp_copy_visible(uint16_t *dst);
 /* The visible picture, landscape, as /sd/screenshots/shot_NNN.bmp; path (may be NULL) gets its name. */

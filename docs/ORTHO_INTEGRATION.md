@@ -44,3 +44,17 @@ PAPP FAST allocation, audio underruns, touch corners and screenshot orientation.
 Test cold boot, scrolling, Store, Wi-Fi, repeated home/app/home, forced exits,
 overlays, suspend/scanout and long-running applications. Do not publish OTA
 or claim FPS improvements from compilation alone.
+
+## Stage 2 prototype (ortho-renderer branch)
+
+LVGL 9.6 and the external 0.2.0 registry package are pinned. The optional
+CONFIG_LX_USE_ORTHO path is restricted to Tab5 with a native 90/270 degree
+panel, two framebuffers, compatible stride and conservative heap gates.
+One core and 32 KiB tile blocks; the original renderer is the default.
+A private native buffer prevents LVGL from drawing into app scanout buffers;
+its full frame is still copied by the compositor, not zero-copy. PPA init
+failure leaves the original path; DMA stall stops Ortho presentation and
+requires reset. This prototype does not change the original BSP's retirement
+semantics, which still require board validation. The game PPA path and ABI
+are unchanged. No speedup or hardware reliability is claimed. CI builds
+both configurations on all seven boards and tests coordinate round trips.

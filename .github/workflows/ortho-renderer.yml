@@ -1,0 +1,44 @@
+name: Ortho experimental renderer
+on:
+  push:
+    branches: [ortho-renderer]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: cc -std=c11 -Wall -Wextra -Werror -fsanitize=undefined tests/host/test_ortho_coords.c -o /tmp/ortho_coords && /tmp/ortho_coords
+  compile:
+    runs-on: ubuntu-24.04
+    container: espressif/idf:v5.5.6
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        board: [m5stack_tab5, guition_p4_43, guition_p4_43_v3, guition_p4_7, guition_p4_7_v3, waveshare_p4_35, elecrow_p4_aio]
+        ortho: ["off", "on"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (not a release)
+        shell: bash
+        env:
+          BOARD: ${{ matrix.board }}
+          ORTHO: ${{ matrix.ortho }}
+        run: |
+          set -eo pipefail
+          . "$IDF_PATH/export.sh" > /dev/null
+          cd launcher
+          if [ "$ORTHO" = on ]; then
+            echo CONFIG_LX_USE_ORTHO=y >> sdkconfig.defaults
+          fi
+          idf.py -B build_ortho -DLX_BOARD="$BOARD" build
+          if [ "$ORTHO" = on ]; then
+            grep -x CONFIG_LX_USE_ORTHO=y "sdkconfig.$BOARD"
+            grep -x CONFIG_LV_DRAW_TRANSFORM_USE_MATRIX=y "sdkconfig.$BOARD"
+          else
+            grep -x '# CONFIG_LX_USE_ORTHO is not set' "sdkconfig.$BOARD"
+          fi
+          idf.py -B build_ortho -DLX_BOARD="$BOARD" size

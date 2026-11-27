@@ -1,0 +1,8 @@
+menu "Launcher experimental rendering"
+config LX_USE_ORTHO
+    bool "Experimental external lv_draw_ortho home renderer (Tab5)"
+    default n
+    help
+        Use the external registry component with a private native-orientation
+        RGB565 buffer. The compositor still owns the panel. Not a release.
+endmenu

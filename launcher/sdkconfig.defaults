@@ -84,3 +84,8 @@ CONFIG_GPTIMER_CTRL_FUNC_IN_IRAM=y
 # (EXT_RAM_BSS_ATTR): internal RAM before the scheduler starts is tight, esp_hosted's boot
 # constructor takes most of it, and FreeRTOS's timer task must still fit after it.
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+
+# External Ortho requirements (renderer opt-in in menuconfig).
+CONFIG_LV_USE_FLOAT=y
+CONFIG_LV_USE_MATRIX=y
+CONFIG_LV_DRAW_TRANSFORM_USE_MATRIX=y
